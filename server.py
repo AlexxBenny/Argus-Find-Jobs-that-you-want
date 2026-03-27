@@ -276,8 +276,15 @@ def _serialize_temp_job(job) -> dict:
 
 dashboard_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
+# Health check (Render pings this)
+@app.get("/health")
+@app.head("/health")
+def health_check():
+    return {"status": "ok"}
+
 # Serve index.html at root
 @app.get("/")
+@app.head("/")
 def serve_dashboard():
     index_path = os.path.join(dashboard_dir, "index.html")
     if os.path.exists(index_path):
