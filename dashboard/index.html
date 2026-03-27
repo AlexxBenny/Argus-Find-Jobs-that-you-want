@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Intelligence Agent — Dashboard</title>
+    <meta name="description" content="AI-powered job tracking dashboard with preference learning">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+    <!-- ─── HEADER ─── -->
+    <header id="app-header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <h1>Job<span class="accent">Intel</span></h1>
+            </div>
+            <span class="subtitle">AI-Powered Job Intelligence</span>
+        </div>
+        <div class="header-right">
+            <button class="btn btn-ghost" id="btn-settings" onclick="toggleSettings()">
+                <span>⚙️</span> Settings
+            </button>
+            <button class="btn btn-primary" id="btn-trigger" onclick="triggerAgent()">
+                <span>🚀</span> Run Agent
+            </button>
+        </div>
+    </header>
+
+    <!-- ─── STATS BAR ─── -->
+    <section id="stats-bar">
+        <div class="stat-card" id="stat-saved">
+            <div class="stat-value" id="stat-saved-val">—</div>
+            <div class="stat-label">Saved</div>
+        </div>
+        <div class="stat-card" id="stat-applied">
+            <div class="stat-value" id="stat-applied-val">—</div>
+            <div class="stat-label">Applied</div>
+        </div>
+        <div class="stat-card" id="stat-interviewing">
+            <div class="stat-value" id="stat-interviewing-val">—</div>
+            <div class="stat-label">Interviewing</div>
+        </div>
+        <div class="stat-card" id="stat-offered">
+            <div class="stat-value" id="stat-offered-val">—</div>
+            <div class="stat-label">Offered</div>
+        </div>
+        <div class="stat-card" id="stat-pending">
+            <div class="stat-value" id="stat-pending-val">—</div>
+            <div class="stat-label">Pending Review</div>
+        </div>
+        <div class="stat-card" id="stat-feedback">
+            <div class="stat-value" id="stat-feedback-val">—</div>
+            <div class="stat-label">Feedback Given</div>
+        </div>
+    </section>
+
+    <!-- ─── TAB NAV ─── -->
+    <nav id="tab-nav">
+        <button class="tab active" data-tab="saved" onclick="switchTab('saved')">
+            💼 Saved Jobs
+        </button>
+        <button class="tab" data-tab="pending" onclick="switchTab('pending')">
+            ⏳ Pending Review
+        </button>
+        <button class="tab" data-tab="learning" onclick="switchTab('learning')">
+            🧠 Learning
+        </button>
+    </nav>
+
+    <!-- ─── FILTER BAR (saved jobs) ─── -->
+    <div id="filter-bar" class="filter-bar">
+        <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="search-input" placeholder="Search jobs..." oninput="debouncedSearch()">
+        </div>
+        <div class="filter-chips">
+            <button class="chip active" data-status="all" onclick="filterByStatus('all')">All</button>
+            <button class="chip" data-status="saved" onclick="filterByStatus('saved')">Saved</button>
+            <button class="chip" data-status="applied" onclick="filterByStatus('applied')">Applied</button>
+            <button class="chip" data-status="interviewing" onclick="filterByStatus('interviewing')">Interviewing</button>
+            <button class="chip" data-status="offered" onclick="filterByStatus('offered')">Offered</button>
+            <button class="chip" data-status="rejected" onclick="filterByStatus('rejected')">Rejected</button>
+        </div>
+    </div>
+
+    <!-- ─── MAIN CONTENT ─── -->
+    <main id="main-content">
+        <!-- Saved Jobs Tab -->
+        <div id="tab-saved" class="tab-content active">
+            <div id="jobs-grid" class="jobs-grid">
+                <div class="empty-state" id="empty-saved">
+                    <div class="empty-icon">📭</div>
+                    <h3>No saved jobs yet</h3>
+                    <p>Jobs you approve via Telegram will appear here</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Pending Review Tab -->
+        <div id="tab-pending" class="tab-content">
+            <div id="pending-grid" class="jobs-grid">
+                <div class="empty-state" id="empty-pending">
+                    <div class="empty-icon">⏳</div>
+                    <h3>No pending jobs</h3>
+                    <p>Jobs awaiting your review will appear here</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Learning Tab -->
+        <div id="tab-learning" class="tab-content">
+            <div id="learning-content" class="learning-section">
+                <div class="learning-card">
+                    <h3>🧠 Preference Learning Status</h3>
+                    <div id="learning-stats">Loading...</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ─── SETTINGS MODAL ─── -->
+    <div id="settings-overlay" class="modal-overlay" onclick="closeSettings(event)">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2>⚙️ Agent Settings</h2>
+                <button class="btn-close" onclick="toggleSettings()">✕</button>
+            </div>
+            <div class="modal-body" id="settings-body">
+                Loading filters...
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="saveAllSettings()">💾 Save All</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── JOB DETAIL MODAL ─── -->
+    <div id="detail-overlay" class="modal-overlay" onclick="closeDetail(event)">
+        <div class="modal modal-lg" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2 id="detail-title">Job Details</h2>
+                <button class="btn-close" onclick="closeDetailModal()">✕</button>
+            </div>
+            <div class="modal-body" id="detail-body">
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── TOAST ─── -->
+    <div id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

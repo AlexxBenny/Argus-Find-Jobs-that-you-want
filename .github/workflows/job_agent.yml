@@ -1,0 +1,46 @@
+name: Job Intelligence Agent
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'    # Every hour
+
+concurrency:
+  group: job-agent-run
+  cancel-in-progress: false
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent
+        env:
+          OPENROUTER_API_KEY:   ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL:     ${{ vars.OPENROUTER_MODEL || 'google/gemini-2.5-flash' }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_USER_ID:        ${{ secrets.ADMIN_USER_ID }}
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          JOBS_PER_SOURCE:      ${{ vars.JOBS_PER_SOURCE || '15' }}
+          TOP_K_DELIVER:        ${{ vars.TOP_K_DELIVER || '10' }}
+        run: python agent.py
