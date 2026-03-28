@@ -120,6 +120,14 @@ def process_webhook_update(update_data: dict) -> dict:
     emoji = "👍 Saved!" if action == "up" else "👎 Passed!"
     _answer_callback(callback_id, emoji)
 
+    # Remove buttons and update message with status
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+
+    if chat_id and message_id:
+        _update_message_after_feedback(chat_id, message_id, message, action)
+
     return {
         "processed": True,
         "action": action,
@@ -134,6 +142,59 @@ def validate_webhook_secret(secret_header: str) -> bool:
     if not WEBHOOK_SECRET:
         return True  # No secret configured = skip validation
     return secret_header == WEBHOOK_SECRET
+
+
+def _update_message_after_feedback(chat_id: int, message_id: int, message: dict, action: str):
+    """
+    Edit the original job message after feedback:
+    - Remove the inline keyboard (Save/Pass buttons)
+    - Append a status line showing the action taken
+    """
+    # Get original text from the message
+    original_text = message.get("text") or ""
+
+    # Build status footer
+    if action == "up":
+        status = "\n\n✅ *Saved to tracker*"
+    else:
+        status = "\n\n❌ *Passed*"
+
+    # Remove the old "Tap 👍 to save or 👎 to pass" line and append status
+    updated_text = original_text.replace("Tap 👍 to save or 👎 to pass", "").rstrip()
+    updated_text += status
+
+    url = f"{_BASE_URL}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": updated_text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+        # No reply_markup = buttons removed
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            # Fallback: just remove the keyboard without changing text
+            _remove_keyboard(chat_id, message_id)
+    except requests.exceptions.RequestException:
+        # Fallback: just remove the keyboard
+        _remove_keyboard(chat_id, message_id)
+
+
+def _remove_keyboard(chat_id: int, message_id: int):
+    """Fallback: just remove the inline keyboard without changing text."""
+    url = f"{_BASE_URL}/editMessageReplyMarkup"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": {"inline_keyboard": []},
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except requests.exceptions.RequestException:
+        pass
 
 
 # ═══════════════════════════════════════════
