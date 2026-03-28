@@ -10,12 +10,108 @@ Checks:
   3. Location matching
   4. Salary floor check
   5. Already exists in DB (dedup)
+  6. Experience requirement extraction + hard rejection
 """
 
 import re
 from sqlalchemy.orm import Session
 from db.models import JobTemp, JobMain
 
+
+# ═══════════════════════════════════════════
+#  EXPERIENCE EXTRACTION (regex-based)
+# ═══════════════════════════════════════════
+
+# Ordered from most specific to least — first match wins
+_EXPERIENCE_PATTERNS = [
+    # "minimum 4 years" / "at least 4 years" / "min 4 years"
+    re.compile(
+        r"(?:minimum|min(?:imum)?|at\s+least)\s+"
+        r"(\d+)\s*(?:\+)?\s*(?:years?|yrs?)",
+        re.IGNORECASE,
+    ),
+    # "4+ years" / "4 + years"
+    re.compile(
+        r"(\d+)\s*\+\s*(?:years?|yrs?)",
+        re.IGNORECASE,
+    ),
+    # "4-6 years" / "4 to 6 years" / "4 – 6 years"
+    re.compile(
+        r"(\d+)\s*(?:[-–—]|to)\s*(\d+)\s*(?:years?|yrs?)",
+        re.IGNORECASE,
+    ),
+    # "4 years of experience" / "4 years experience" / "4 yrs exp"
+    re.compile(
+        r"(\d+)\s*(?:years?|yrs?)\s*(?:of\s+)?(?:experience|exp|work)",
+        re.IGNORECASE,
+    ),
+    # "experience: 4 years" / "experience of 4 years"
+    re.compile(
+        r"experience\s*(?::|of|–|-)?\s*(\d+)\s*(?:\+)?\s*(?:years?|yrs?)",
+        re.IGNORECASE,
+    ),
+    # Standalone "X years" near relevant context words
+    re.compile(
+        r"(?:require[sd]?|need[sd]?|must\s+have|having|with)\s+"
+        r"(\d+)\s*(?:\+)?\s*(?:years?|yrs?)",
+        re.IGNORECASE,
+    ),
+]
+
+# Patterns that indicate fresher-friendly / entry-level
+_FRESHER_PATTERNS = re.compile(
+    r"(?:fresher|entry[- ]?level|0[- ]+\d+\s*(?:years?|yrs?)|"
+    r"new\s+grad|recent\s+grad|no\s+experience\s+required|"
+    r"0\s*\+?\s*(?:years?|yrs?))",
+    re.IGNORECASE,
+)
+
+
+def extract_experience_years(text: str) -> dict:
+    """
+    Extract experience requirements from job description text.
+
+    Uses layered regex parsing to handle common patterns.
+
+    Returns:
+        {"min": int|None, "max": int|None}
+        - min: minimum years required (None if not found)
+        - max: maximum years in range (None if not a range)
+    """
+    if not text:
+        return {"min": None, "max": None}
+
+    # Check fresher-friendly indicators first
+    if _FRESHER_PATTERNS.search(text):
+        # If explicitly says "0-2 years" or "fresher", that's fine
+        # But still try to extract a range
+        pass
+
+    # Try each pattern in priority order
+    for pattern in _EXPERIENCE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            groups = match.groups()
+            try:
+                min_years = int(groups[0])
+                max_years = int(groups[1]) if len(groups) > 1 and groups[1] else None
+
+                # Sanity check: years should be reasonable (0-30)
+                if min_years > 30:
+                    continue
+                if max_years and max_years > 30:
+                    max_years = None
+
+                return {"min": min_years, "max": max_years}
+            except (ValueError, IndexError):
+                continue
+
+    return {"min": None, "max": None}
+
+
+# ═══════════════════════════════════════════
+#  MAIN PRE-FILTER
+# ═══════════════════════════════════════════
 
 def prefilter_jobs(
     jobs: list[dict],
@@ -36,10 +132,12 @@ def prefilter_jobs(
     required_skills = [s.lower() for s in filters.get("required_skills", [])]
     deal_breaker_salary = filters.get("deal_breaker_salary_max", 0)
     search_terms = filters.get("search_terms", [])
+    experience_max = filters.get("experience_max", 2)
 
     for job in jobs:
         reason = _check_job(job, excluded_keywords, required_skills,
-                            deal_breaker_salary, db, search_terms)
+                            deal_breaker_salary, db, search_terms,
+                            experience_max)
         if reason:
             job["rejection_reason"] = reason
             rejected.append(job)
@@ -56,6 +154,7 @@ def _check_job(
     deal_breaker_salary: int,
     db: Session,
     search_terms: list[str] = None,
+    experience_max: int = 2,
 ) -> str | None:
     """
     Check a single job against filters.
@@ -109,7 +208,19 @@ def _check_job(
         if parsed and parsed["max"] and parsed["max"] < deal_breaker_salary:
             return f"salary too low: {job['salary']} (below {deal_breaker_salary})"
 
-    # ── 6. Minimum skill relevance ──
+    # ── 6. Experience hard rejection ──
+    exp = extract_experience_years(description)
+    if exp["min"] is not None and exp["min"] > experience_max:
+        return (f"experience too high: JD requires {exp['min']}+ years "
+                f"(user max: {experience_max})")
+
+    # Also check title for senior/lead indicators with high experience
+    exp_title = extract_experience_years(title)
+    if exp_title["min"] is not None and exp_title["min"] > experience_max:
+        return (f"experience too high in title: requires {exp_title['min']}+ years "
+                f"(user max: {experience_max})")
+
+    # ── 7. Minimum skill relevance ──
     # Must have at least 1 required skill in TITLE, or 2+ in description
     if required_skills:
         title_skills = sum(1 for s in required_skills if s in title)
@@ -135,6 +246,7 @@ def compute_rule_score(job: dict, filters: dict) -> float:
     required_skills = [s.lower() for s in filters.get("required_skills", [])]
     preferred_companies = [c.lower() for c in filters.get("preferred_companies", [])]
     preferred_salary = filters.get("preferred_salary_min", 0)
+    experience_max = filters.get("experience_max", 2)
 
     # ── Skill matches (up to +30) ──
     skill_matches = sum(1 for s in required_skills if s in combined)
@@ -159,6 +271,14 @@ def compute_rule_score(job: dict, filters: dict) -> float:
     # ── Has apply URL (+5) ──
     if job.get("url"):
         score += 5
+
+    # ── Experience fit bonus/penalty ──
+    exp = extract_experience_years(description)
+    if exp["min"] is not None:
+        if exp["min"] <= experience_max:
+            score += 10  # Good fit — within range
+        # Note: jobs over experience_max are already hard-rejected in prefilter
+        # This branch handles edge cases that slip through
 
     return min(100.0, max(0.0, score))
 

@@ -1,14 +1,13 @@
 """
-Job Scraper — Multi-source fetching via JobSpy
+Job Scraper — Multi-source fetching
 
-Uses python-jobspy to aggregate from:
-  - Indeed
-  - Glassdoor
-  - Google Jobs
-  - ZipRecruiter
-  - LinkedIn (deprioritized, configurable)
+Sources:
+  - JobSpy (Indeed, Google, LinkedIn, Glassdoor, ZipRecruiter)
+  - RemoteOK (public JSON API — no key needed)
+  - Adzuna (pluggable — only if API keys are configured)
 
 Sources are read from the DB filters on each run.
+New sources are merged and deduped with JobSpy results.
 """
 
 import traceback
@@ -19,14 +18,19 @@ from db.crud import compute_job_hash
 def fetch_jobs(search_term: str, location: str,
                sources: list, results_wanted: int = 15) -> list[dict]:
     """
-    Fetch jobs from multiple sources using JobSpy.
+    Fetch jobs from JobSpy sources (indeed, google, linkedin, etc.).
     Returns normalized list of job dicts.
     """
+    # Filter to only JobSpy-supported sources
+    jobspy_sources = [s for s in sources if s in _JOBSPY_SOURCES]
+    if not jobspy_sources:
+        return []
+
     from jobspy import scrape_jobs
 
     try:
         df = scrape_jobs(
-            site_name=sources,
+            site_name=jobspy_sources,
             search_term=search_term,
             location=location,
             results_wanted=results_wanted,
@@ -45,9 +49,17 @@ def fetch_jobs(search_term: str, location: str,
         return []
 
 
+# Sources handled by python-jobspy
+_JOBSPY_SOURCES = {"indeed", "google", "linkedin", "glassdoor", "zip_recruiter"}
+
+# Sources handled by our custom scrapers
+_CUSTOM_SOURCES = {"remoteok", "adzuna"}
+
+
 def fetch_all_configured_jobs(filters: dict, jobs_per_source: int = 15) -> list[dict]:
     """
-    Run all configured search_terms × locations, dedup, return combined list.
+    Run all configured search_terms × locations, plus custom sources.
+    Dedup and return combined list.
 
     Args:
         filters: Dict from DB with search_terms, locations, sources, etc.
@@ -58,7 +70,7 @@ def fetch_all_configured_jobs(filters: dict, jobs_per_source: int = 15) -> list[
     """
     search_terms = filters.get("search_terms", [])
     locations = filters.get("locations", [])
-    sources = filters.get("sources", ["indeed", "google"])
+    enabled_sources = filters.get("sources", ["indeed", "google"])
 
     if not search_terms:
         print("  [SCRAPER] No search terms configured!")
@@ -71,20 +83,69 @@ def fetch_all_configured_jobs(filters: dict, jobs_per_source: int = 15) -> list[
     seen_hashes = set()
     total_fetched = 0
 
-    for term in search_terms:
-        for location in locations:
-            print(f"  [SCRAPER] Searching '{term}' in '{location}' "
-                  f"via {sources}...")
-            jobs = fetch_jobs(term, location, sources, jobs_per_source)
-            total_fetched += len(jobs)
+    # ── Phase 1: JobSpy sources ──
+    jobspy_enabled = [s for s in enabled_sources if s in _JOBSPY_SOURCES]
+    if jobspy_enabled:
+        for term in search_terms:
+            for location in locations:
+                print(f"  [SCRAPER] Searching '{term}' in '{location}' "
+                      f"via {jobspy_enabled}...")
+                jobs = fetch_jobs(term, location, jobspy_enabled, jobs_per_source)
+                total_fetched += len(jobs)
 
-            for job in jobs:
+                for job in jobs:
+                    if job["hash"] not in seen_hashes:
+                        seen_hashes.add(job["hash"])
+                        all_jobs.append(job)
+
+                print(f"    → {len(jobs)} results "
+                      f"({len(all_jobs)} unique total)")
+
+    # ── Phase 2: RemoteOK ──
+    if "remoteok" in enabled_sources:
+        print(f"  [SCRAPER] Fetching from RemoteOK API...")
+        try:
+            from scraper.remoteok import fetch_remoteok_jobs
+            rok_jobs = fetch_remoteok_jobs(
+                search_terms=search_terms,
+                results_wanted=jobs_per_source * 2,  # Single API call, get more
+                hours_old=72,
+            )
+            total_fetched += len(rok_jobs)
+            for job in rok_jobs:
                 if job["hash"] not in seen_hashes:
                     seen_hashes.add(job["hash"])
                     all_jobs.append(job)
-
-            print(f"    → {len(jobs)} results "
+            print(f"    → {len(rok_jobs)} results from RemoteOK "
                   f"({len(all_jobs)} unique total)")
+        except Exception as e:
+            print(f"  [SCRAPER ERROR] RemoteOK failed: {e}")
+            traceback.print_exc()
+
+    # ── Phase 3: Adzuna (pluggable — only if keys configured) ──
+    if "adzuna" in enabled_sources:
+        try:
+            from scraper.adzuna import fetch_adzuna_jobs, is_available
+            if is_available():
+                print(f"  [SCRAPER] Fetching from Adzuna API...")
+                adz_jobs = fetch_adzuna_jobs(
+                    search_terms=search_terms,
+                    locations=locations,
+                    results_wanted=jobs_per_source,
+                    hours_old=72,
+                )
+                total_fetched += len(adz_jobs)
+                for job in adz_jobs:
+                    if job["hash"] not in seen_hashes:
+                        seen_hashes.add(job["hash"])
+                        all_jobs.append(job)
+                print(f"    → {len(adz_jobs)} results from Adzuna "
+                      f"({len(all_jobs)} unique total)")
+            else:
+                print(f"  [SCRAPER] Adzuna enabled but API keys not set — skipping")
+        except Exception as e:
+            print(f"  [SCRAPER ERROR] Adzuna failed: {e}")
+            traceback.print_exc()
 
     print(f"  [SCRAPER] Total: {total_fetched} fetched, "
           f"{len(all_jobs)} unique after dedup")

@@ -3,6 +3,7 @@ LLM Scorer — Layer 2 (Gemini 2.5 Flash via OpenRouter)
 
 Scores pre-filtered jobs using structured JSON output.
 Includes few-shot examples from user's feedback history.
+Enforces hard constraints on experience mismatch.
 """
 
 import json
@@ -33,7 +34,8 @@ def score_single_job(
         feedback_context: Dict with liked/disliked examples from feedback history.
 
     Returns:
-        Dict with: fit_score (0-100), role_match, red_flags, match_reason, is_genuine
+        Dict with: fit_score (0-100), role_match, red_flags, match_reason,
+                   is_genuine, experience_required
     """
     prompt = _build_scoring_prompt(job, user_profile, feedback_context)
 
@@ -53,13 +55,33 @@ def score_single_job(
             raw = response.choices[0].message.content.strip()
             result = json.loads(raw)
 
-            # Validate and normalize
+            fit_score = max(0, min(100, int(result.get("fit_score", 0))))
+
+            # Double-check experience constraint in code
+            experience_required = result.get("experience_required")
+            experience_max = user_profile.get("experience_max", 2)
+
+            if experience_required is not None:
+                try:
+                    exp_req = int(experience_required)
+                    if exp_req > experience_max:
+                        # Hard cap: LLM might have been lenient
+                        fit_score = min(fit_score, 25)
+                        result["red_flags"] = (
+                            f"Requires {exp_req} years experience "
+                            f"(your max: {experience_max}). "
+                            + str(result.get("red_flags", ""))
+                        )
+                except (ValueError, TypeError):
+                    pass
+
             return {
-                "fit_score": max(0, min(100, int(result.get("fit_score", 0)))),
+                "fit_score": fit_score,
                 "role_match": str(result.get("role_match", "")),
                 "red_flags": str(result.get("red_flags", "None")),
                 "match_reason": str(result.get("match_reason", "")),
                 "is_genuine": bool(result.get("is_genuine", True)),
+                "experience_required": experience_required,
             }
 
         except json.JSONDecodeError:
@@ -88,6 +110,7 @@ def score_single_job(
         "red_flags": "Could not analyze",
         "match_reason": "LLM scoring unavailable",
         "is_genuine": True,
+        "experience_required": None,
     }
 
 
@@ -123,7 +146,12 @@ def score_batch(
 
 SYSTEM_PROMPT = """You are an expert AI job market analyst and career advisor.
 Your task is to evaluate job postings for a candidate and score their relevance.
-You MUST respond with valid JSON only. No markdown, no extra text."""
+
+CRITICAL RULES:
+1. You MUST respond with valid JSON only. No markdown, no extra text.
+2. You MUST extract the required years of experience from the job description.
+3. If the required experience exceeds the candidate's maximum, the fit_score MUST be ≤ 25.
+4. Be strict about experience requirements — do not be lenient."""
 
 
 def _build_scoring_prompt(
@@ -149,7 +177,7 @@ def _build_scoring_prompt(
 ## CANDIDATE PROFILE
 - Target Roles: {', '.join(search_terms)}
 - Must-Have Skills: {', '.join(required_skills)}
-- Experience Level: {experience_min}-{experience_max} years
+- Experience Level: {experience_min}-{experience_max} years (HARD LIMIT — candidate has at most {experience_max} years)
 - Preferred Salary: ≥ {preferred_salary / 100000:.0f} LPA
 - Preferred Companies: {', '.join(preferred_companies[:10])}
 - Deal Breakers: {', '.join(excluded_keywords)}
@@ -185,24 +213,36 @@ def _build_scoring_prompt(
 
         prompt += "\nUse these signals to adjust scoring. Prefer patterns from liked jobs.\n"
 
-    prompt += """
+    prompt += f"""
 ## SCORING INSTRUCTIONS
-Evaluate and respond with this exact JSON structure:
-{
+
+STEP 1: Extract the minimum years of experience required from the job description.
+Look for patterns like "X+ years", "X-Y years", "minimum X years", etc.
+If the description says "fresher" or "0 years", set experience_required to 0.
+If experience is not mentioned, set experience_required to null.
+
+STEP 2: Compare extracted experience with candidate's maximum ({experience_max} years).
+- If experience_required > {experience_max}: fit_score MUST be ≤ 25 (HARD RULE)
+- If experience_required <= {experience_max}: score normally
+
+STEP 3: Evaluate overall fit and respond with this exact JSON structure:
+{{
     "fit_score": <integer 0-100>,
     "role_match": "<1-2 sentence explanation of role fit>",
     "red_flags": "<any concerns, deceptive patterns, or 'None detected'>",
     "match_reason": "<1-2 sentence summary of why this job matches or doesn't>",
-    "is_genuine": <true/false — whether this is a real, legitimate job posting>
-}
+    "is_genuine": <true/false — whether this is a real, legitimate job posting>,
+    "experience_required": <integer or null — years of experience the JD requires>
+}}
 
 Scoring guide:
-- 85-100: Perfect match — right role, right skills, strong company
-- 70-84: Strong match — most criteria met
+- 85-100: Perfect match — right role, right skills, right experience level, strong company
+- 70-84: Strong match — most criteria met, experience within range
 - 50-69: Moderate match — some criteria met, some gaps
-- 30-49: Weak match — significant gaps
-- 0-29: Poor match — wrong role, deal-breakers present
+- 30-49: Weak match — significant gaps but experience is acceptable
+- 0-25: Poor match — experience too high, wrong role, or deal-breakers present
 
+CRITICAL: If the job requires more than {experience_max} years of experience, score ≤ 25.
 Be strict. Detect jobs that disguise non-AI roles as AI roles.
 Penalize vague descriptions, missing company info, or unrealistic requirements.
 """

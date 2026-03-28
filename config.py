@@ -20,6 +20,18 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
+# ─── Telegram Webhook ───
+# Auto-detected from Render's RENDER_EXTERNAL_URL, or set manually
+WEBHOOK_BASE_URL = os.getenv(
+    "WEBHOOK_BASE_URL",
+    os.getenv("RENDER_EXTERNAL_URL", ""),
+).rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "argus-job-agent-secret")
+
+# ─── Adzuna (pluggable — only used if keys are present) ───
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+
 # ─── Database ───
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///job_agent.db")
 
@@ -36,6 +48,9 @@ WEIGHT_RULE = 0.1
 # ─── LLM Scoring Thresholds ───
 SCORE_AUTO_REJECT = 30  # Below this → never sent to Telegram
 SCORE_LOW_PRIORITY = 60  # Below this → lower Telegram priority
+
+# ─── Keep-Alive ───
+KEEP_ALIVE_INTERVAL_SECONDS = int(os.getenv("KEEP_ALIVE_INTERVAL", "600"))  # 10 min
 
 # ─── Default Filter Profile (used to seed the DB on first run) ───
 DEFAULT_FILTERS = {
@@ -75,9 +90,8 @@ DEFAULT_FILTERS = {
     ],
     "sources": [
         "indeed",
-        "glassdoor",
         "google",
-        "zip_recruiter",
+        "remoteok",
     ],
     "sources_available": [
         "indeed",
@@ -85,5 +99,7 @@ DEFAULT_FILTERS = {
         "glassdoor",
         "google",
         "zip_recruiter",
+        "remoteok",
+        "adzuna",
     ],
 }

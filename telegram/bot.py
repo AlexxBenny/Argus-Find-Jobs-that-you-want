@@ -1,17 +1,139 @@
 """
-Telegram Bot — Job delivery + Feedback polling
+Telegram Bot — Job delivery + Webhook-based feedback
 
-Direct Telegram Bot API (lightweight, no heavy library).
+Two feedback modes:
+  1. WEBHOOK (primary) — Instant. FastAPI endpoint receives callbacks in real-time.
+  2. POLLING (fallback) — Used during agent runs to catch any missed callbacks.
+
 Sends richly formatted job cards with inline 👍/👎 buttons.
-Polls for callback queries to process feedback.
 """
 
 import requests
 import time
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_USER_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_USER_ID, WEBHOOK_SECRET
 
 
 _BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+
+# ═══════════════════════════════════════════
+#  WEBHOOK MANAGEMENT
+# ═══════════════════════════════════════════
+
+def register_webhook(base_url: str) -> dict:
+    """
+    Register the webhook URL with Telegram.
+    Call this on server startup.
+
+    Args:
+        base_url: Public base URL (e.g. https://argus-find-jobs-that-you-want.onrender.com)
+
+    Returns:
+        {"ok": bool, "description": str}
+    """
+    webhook_url = f"{base_url}/api/telegram/webhook"
+    url = f"{_BASE_URL}/setWebhook"
+    payload = {
+        "url": webhook_url,
+        "secret_token": WEBHOOK_SECRET,
+        "allowed_updates": ["callback_query"],  # Only receive button presses
+        "drop_pending_updates": False,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        body = resp.json()
+
+        if body.get("ok"):
+            print(f"  [TELEGRAM] Webhook registered: {webhook_url}")
+            return {"ok": True, "description": body.get("description", "OK")}
+        else:
+            print(f"  [TELEGRAM] Webhook registration failed: {body}")
+            return {"ok": False, "description": body.get("description", "Unknown error")}
+
+    except requests.exceptions.RequestException as e:
+        print(f"  [TELEGRAM] Webhook registration error: {e}")
+        return {"ok": False, "description": str(e)}
+
+
+def delete_webhook() -> dict:
+    """Remove the webhook (switch back to polling mode)."""
+    url = f"{_BASE_URL}/deleteWebhook"
+    try:
+        resp = requests.post(url, timeout=15)
+        body = resp.json()
+        return {"ok": body.get("ok", False), "description": body.get("description", "")}
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "description": str(e)}
+
+
+def get_webhook_info() -> dict:
+    """Get current webhook status from Telegram."""
+    url = f"{_BASE_URL}/getWebhookInfo"
+    try:
+        resp = requests.get(url, timeout=15)
+        return resp.json().get("result", {})
+    except requests.exceptions.RequestException:
+        return {}
+
+
+def process_webhook_update(update_data: dict) -> dict:
+    """
+    Process a single incoming webhook update from Telegram.
+    Called synchronously by the FastAPI endpoint — no queueing.
+
+    Args:
+        update_data: Raw update JSON from Telegram.
+
+    Returns:
+        {"processed": bool, "action": str|None, "job_hash": str|None, "error": str|None}
+    """
+    callback = update_data.get("callback_query") or {}
+    if not callback:
+        return {"processed": False, "action": None, "job_hash": None, "error": "No callback_query"}
+
+    callback_id = callback.get("id", "")
+    payload = callback.get("data", "")
+
+    # Validate callback format: "job:up:abc123" or "job:down:abc123"
+    if not payload.startswith("job:"):
+        _answer_callback(callback_id, "Unknown action")
+        return {"processed": False, "action": None, "job_hash": None, "error": "Not a job callback"}
+
+    parts = payload.split(":", 2)
+    if len(parts) != 3 or parts[1] not in ("up", "down"):
+        _answer_callback(callback_id, "Invalid action")
+        return {"processed": False, "action": None, "job_hash": None, "error": "Invalid format"}
+
+    # Admin-only check
+    user = callback.get("from") or {}
+    user_id = str(user.get("id", "unknown"))
+
+    if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+        _answer_callback(callback_id, "Feedback restricted to admin.")
+        return {"processed": False, "action": None, "job_hash": None, "error": "Not admin"}
+
+    action = parts[1]
+    job_hash = parts[2]
+
+    # Acknowledge the button press IMMEDIATELY
+    emoji = "👍 Saved!" if action == "up" else "👎 Passed!"
+    _answer_callback(callback_id, emoji)
+
+    return {
+        "processed": True,
+        "action": action,
+        "job_hash": job_hash,
+        "user_id": user_id,
+        "error": None,
+    }
+
+
+def validate_webhook_secret(secret_header: str) -> bool:
+    """Validate the X-Telegram-Bot-Api-Secret-Token header."""
+    if not WEBHOOK_SECRET:
+        return True  # No secret configured = skip validation
+    return secret_header == WEBHOOK_SECRET
 
 
 # ═══════════════════════════════════════════
@@ -160,12 +282,13 @@ def _escape_md(text: str) -> str:
 
 
 # ═══════════════════════════════════════════
-#  POLL FEEDBACK (callback queries)
+#  POLL FEEDBACK (fallback — used during agent runs)
 # ═══════════════════════════════════════════
 
 def pull_feedback(last_update_id: int = 0) -> dict:
     """
     Poll for new feedback from Telegram callback queries.
+    This is the FALLBACK method — webhook handles most callbacks in real-time.
 
     Returns:
         {

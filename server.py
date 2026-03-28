@@ -1,5 +1,5 @@
 """
-FastAPI Server — Dashboard API + Static File Serving
+FastAPI Server — Dashboard API + Telegram Webhook + Static File Serving
 
 Endpoints:
   - GET  /api/stats          — Dashboard overview stats
@@ -14,16 +14,20 @@ Endpoints:
   - PUT  /api/filters/{key}  — Update a filter
   - GET  /api/learning       — Preference learning stats
   - POST /api/trigger        — Manually trigger agent run
+  - POST /api/telegram/webhook — Telegram callback webhook (real-time feedback)
+  - POST /api/telegram/setup-webhook — Manually re-register webhook
+  - GET  /api/telegram/webhook-info  — Check webhook status
 
 Static dashboard served from /dashboard/ directory.
 """
 
 import os
+import asyncio
 import threading
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,12 +42,46 @@ from db.crud import (
     get_dashboard_stats,
 )
 from learning.preference_engine import PreferenceEngine
+from telegram.bot import (
+    register_webhook, process_webhook_update, validate_webhook_secret,
+    get_webhook_info,
+)
+from config import WEBHOOK_BASE_URL, KEEP_ALIVE_INTERVAL_SECONDS
+
+
+# ─── Keep-Alive Background Task ───
+async def _keep_alive_loop():
+    """
+    Internal self-ping as a BACKUP keep-alive.
+    Primary keep-alive should be an external service (UptimeRobot, Cron-job.org).
+    This only works while the process is alive — it cannot wake a sleeping instance.
+    """
+    import httpx
+
+    # Wait for server to be fully ready
+    await asyncio.sleep(30)
+
+    ping_url = f"{WEBHOOK_BASE_URL}/health" if WEBHOOK_BASE_URL else None
+
+    while True:
+        try:
+            await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+            if ping_url:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(ping_url, timeout=10)
+                    # Silent — only log failures
+                    if resp.status_code != 200:
+                        print(f"[KEEP-ALIVE] Ping failed: {resp.status_code}")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass  # Never crash the keep-alive loop
 
 
 # ─── Lifespan ───
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize DB and seed filters on startup."""
+    """Initialize DB, seed filters, register webhook, start keep-alive on startup."""
     init_db()
     db = get_session()
     try:
@@ -51,13 +89,40 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     print("[SERVER] Database initialized, filters seeded.")
+
+    # Register Telegram webhook
+    if WEBHOOK_BASE_URL:
+        result = register_webhook(WEBHOOK_BASE_URL)
+        if result.get("ok"):
+            print(f"[SERVER] Telegram webhook active at {WEBHOOK_BASE_URL}/api/telegram/webhook")
+        else:
+            print(f"[SERVER] Webhook registration failed: {result.get('description')}")
+    else:
+        print("[SERVER] No WEBHOOK_BASE_URL set — Telegram webhook NOT registered")
+        print("[SERVER] Set WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL to enable real-time feedback")
+
+    # Start keep-alive background task (backup — use external service as primary)
+    keep_alive_task = None
+    if WEBHOOK_BASE_URL and KEEP_ALIVE_INTERVAL_SECONDS > 0:
+        keep_alive_task = asyncio.create_task(_keep_alive_loop())
+        print(f"[SERVER] Keep-alive ping every {KEEP_ALIVE_INTERVAL_SECONDS}s (backup only)")
+        print("[SERVER] ⚠ For reliable keep-alive, use UptimeRobot or Cron-job.org to ping /health")
+
     yield
+
+    # Cleanup
+    if keep_alive_task:
+        keep_alive_task.cancel()
+        try:
+            await keep_alive_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
     title="Job Intelligence Agent",
     description="Proactive job scraping with preference learning",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -200,6 +265,70 @@ def api_learning_stats(db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════
+#  TELEGRAM WEBHOOK (real-time feedback)
+# ═══════════════════════════════════════════
+
+@app.post("/api/telegram/webhook")
+async def api_telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Receive Telegram callback queries in real-time.
+    Processes Save/Pass button presses synchronously.
+    """
+    # Validate secret token
+    if not validate_webhook_secret(x_telegram_bot_api_secret_token or ""):
+        return JSONResponse({"ok": False}, status_code=403)
+
+    try:
+        update_data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+
+    # Process the callback synchronously — no queueing
+    result = process_webhook_update(update_data)
+
+    if not result.get("processed"):
+        return {"ok": True}  # Still return 200 to Telegram
+
+    action = result["action"]
+    job_hash = result["job_hash"]
+
+    # Execute the approve/reject immediately
+    if action == "up":
+        success = approve_job(db, job_hash)
+        if success:
+            print(f"  [WEBHOOK] 👍 Approved: {job_hash[:12]}...")
+        else:
+            print(f"  [WEBHOOK] ⚠ Approve failed (not found): {job_hash[:12]}...")
+    elif action == "down":
+        success = reject_job(db, job_hash)
+        if success:
+            print(f"  [WEBHOOK] 👎 Rejected: {job_hash[:12]}...")
+        else:
+            print(f"  [WEBHOOK] ⚠ Reject failed (not found): {job_hash[:12]}...")
+
+    return {"ok": True}
+
+
+@app.post("/api/telegram/setup-webhook")
+def api_setup_webhook():
+    """Manually re-register the Telegram webhook."""
+    if not WEBHOOK_BASE_URL:
+        raise HTTPException(400, "WEBHOOK_BASE_URL not configured")
+    result = register_webhook(WEBHOOK_BASE_URL)
+    return result
+
+
+@app.get("/api/telegram/webhook-info")
+def api_webhook_info():
+    """Check current Telegram webhook status."""
+    return get_webhook_info()
+
+
+# ═══════════════════════════════════════════
 #  AGENT TRIGGER
 # ═══════════════════════════════════════════
 
@@ -276,7 +405,7 @@ def _serialize_temp_job(job) -> dict:
 
 dashboard_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 
-# Health check (Render pings this)
+# Health check (Render pings this + external keep-alive services)
 @app.get("/health")
 @app.head("/health")
 def health_check():
